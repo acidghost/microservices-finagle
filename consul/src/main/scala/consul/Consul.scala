@@ -5,11 +5,14 @@ import java.security.cert.{Certificate, CertificateFactory, X509Certificate}
 import java.security.{KeyStore, PrivateKey, Security}
 import java.util.concurrent.atomic.AtomicBoolean
 
-import com.twitter.finagle.Http
+import com.twitter.finagle.{Http, http}
+import com.twitter.finagle.http.service.HttpResponseClassifier
 import com.twitter.finagle.http.{Method, Request, Status}
+import com.twitter.finagle.service.ResponseClass
 import com.twitter.io.Buf
 import com.twitter.logging.Logger
 import com.twitter.util._
+import io.circe.Decoder
 import io.circe.generic.auto._
 import io.circe.parser._
 import io.circe.syntax._
@@ -30,6 +33,8 @@ trait ConsulCAKeyStore {
 }
 
 object Consul {
+
+  class ConsulException(message: String) extends RuntimeException(message)
 
   private case class LeafReply(CertPEM: String, PrivateKeyPEM: String)
 
@@ -55,6 +60,13 @@ object Consul {
     new Consul(serviceName, agentAddress)
   }
 
+  private implicit class EitherOps[E <: Throwable, T](val either: Either[E, T]) extends AnyVal {
+    def asFuture: Future[T] = either match {
+      case Left(e) => Future.exception(e)
+      case Right(t) => Future.value(t)
+    }
+  }
+
 }
 
 class Consul private(
@@ -71,45 +83,37 @@ class Consul private(
   private val isRunning = new AtomicBoolean(false)
   private val timer = new JavaTimer(true)
 
-  private val client = Http.client.newService(agentAddress, s"$serviceName-consul-client")
+  private val client = Http.client
+    .withResponseClassifier(HttpResponseClassifier {
+      case (_, res) if res.status != Status.Ok => ResponseClass.NonRetryableFailure
+    })
+    .newService(agentAddress, s"$serviceName-consul-client")
 
   override def close(deadline: Time): Future[Unit] = synchronized {
     isRunning.set(false)
     Future.Unit
   }
 
+  private def request[A: Decoder, B](req: http.Request)(f: A => B): Future[B] = for {
+    res <- client(req)
+    decoded <- decode[A](res.getContentString()).asFuture
+  } yield f(decoded)
+
   private def requestLeaf(): Future[(PrivateKey, Certificate)] = {
-    val req = Request(Method.Get, s"/v1/agent/connect/ca/leaf/$serviceName")
+    val req = Request(s"/v1/agent/connect/ca/leaf/$serviceName")
     req.headerMap += "Host" -> agentAddress
-    client(req).flatMap { res =>
-      if (res.status == Status.Ok)
-        decode[LeafReply](res.getContentString()) match {
-          case Left(e) =>
-            Future.exception(e)
-          case Right(r) =>
-            val privateKey = privateKeyFromString(r.PrivateKeyPEM)
-            val cert = certificateFromString(r.CertPEM)
-            Future.value((privateKey, cert))
-        }
-      else
-        Future.exception(new RuntimeException(s"Got status code ${res.statusCode}"))
+    request(req) { r: LeafReply =>
+      (privateKeyFromString(r.PrivateKeyPEM), certificateFromString(r.CertPEM))
     }
   }
 
   private def requestRoot(): Future[Certificate] = {
-    val req = Request(Method.Get, s"/v1/agent/connect/ca/roots")
+    val req = Request("/v1/agent/connect/ca/roots")
     req.headerMap += "Host" -> agentAddress
-    client(req).flatMap { res =>
-      if (res.status == Status.Ok)
-        decode[RootReply](res.getContentString()) match {
-          case Left(e) =>
-            Future.exception(e)
-          case Right(r) =>
-            val cert = certificateFromString(r.Roots.head.RootCert)
-            Future.value(cert)
-        }
-      else
-        Future.exception(new RuntimeException(s"Got status code ${res.statusCode}"))
+    request(req) { r: RootReply =>
+      r.Roots.headOption
+        .map(r => certificateFromString(r.RootCert))
+        .getOrElse(throw new ConsulException("Root request returned no certificate"))
     }
   }
 
@@ -121,17 +125,7 @@ class Consul private(
       "Host" -> agentAddress,
       "Content-Type" -> "application/json",
       "Content-Length" -> req.content.length.toString)
-    client(req).flatMap { res =>
-      if (res.status == Status.Ok)
-        decode[AuthorizeReply](res.getContentString()) match {
-          case Left(e) =>
-            Future.exception(e)
-          case Right(r) =>
-            Future.value(r.Authorized)
-        }
-      else
-        Future.exception(new RuntimeException(s"Got status code ${res.statusCode}"))
-    }
+    request[AuthorizeReply, Boolean](req)(_.Authorized)
   }
 
   def authorize(session: SSLSession): Future[Boolean] = {
@@ -191,19 +185,13 @@ class Consul private(
   def run(updateHandler: ((PrivateKey, Certificate, Certificate)) => Unit): Future[Unit] = synchronized {
     isRunning.set(true)
     def run_ : Future[Unit] = {
-      if (isRunning.get()) {
+      if (isRunning.get())
         (requestLeaf() join requestRoot())
           .delayed(requestTimeout)(timer)
           .map { case ((pk, c), ca) => updateHandler((pk, c, ca)) }
           .before(run_)
-      } else Future.Done
+      else Future.Done
     }
-    //def run_ : Future[Unit] =
-    //  (requestLeaf() join requestRoot()).delayed(requestTimeout)(timer) flatMap {
-    //    case ((pk, c), ca) =>
-    //      updateHandler((pk, c, ca))
-    //      if (isRunning.get()) run_ else Future.Done
-    //  }
     run_
   }
 
