@@ -1,0 +1,1 @@
+{"service": {"name": "users", "port": 8081, "connect": {"native": true}}}
